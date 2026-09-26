@@ -1,0 +1,29 @@
+name: Assemble qemu-img gzip
+
+on:
+  push:
+    branches:
+      - qemu-img-raw-stdout
+    paths:
+      - '.upload-chunks/qemu-img-linux-x86_64-static.gz.part*'
+
+permissions:
+  contents: write
+
+jobs:
+  assemble:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Assemble gzip file
+        shell: bash
+        run: |
+          cat .upload-chunks/qemu-img-linux-x86_64-static.gz.part* > qemu-img-linux-x86_64-static.gz
+          rm -rf .upload-chunks
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add qemu-img-linux-x86_64-static.gz .upload-chunks
+          git commit -m 'Add gzipped static qemu-img binary'
+          git push origin HEAD:qemu-img-raw-stdout
