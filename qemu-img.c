@@ -1677,6 +1677,7 @@ typedef struct ImgConvertState {
     enum ImgConvertBlockStatus status;
     int64_t sector_next_status;
     BlockBackend *target;
+    bool stream_output;
     bool has_zero_init;
     bool compressed;
     bool target_is_new;
@@ -1877,6 +1878,14 @@ static int coroutine_fn convert_co_write(ImgConvertState *s, int64_t sector_num,
 {
     int ret;
 
+    if (s->stream_output) {
+        size_t bytes = (size_t)nb_sectors * BDRV_SECTOR_SIZE;
+
+        /* Ordered writes make stdout a contiguous raw image, including zeros. */
+        assert(s->wr_offs == sector_num && status == BLK_DATA);
+        return qemu_write_full(STDOUT_FILENO, buf, bytes) == bytes ? 0 : -errno;
+    }
+
     while (nb_sectors > 0) {
         int n = nb_sectors;
         BdrvRequestFlags flags = s->compressed ? BDRV_REQ_WRITE_COMPRESSED : 0;
@@ -1982,7 +1991,8 @@ static void coroutine_fn convert_co_do_copy(void *opaque)
     assert(index >= 0);
 
     s->running_coroutines++;
-    buf = blk_blockalign(s->target, s->buf_sectors * BDRV_SECTOR_SIZE);
+    buf = blk_blockalign(s->stream_output ? s->src[0] : s->target,
+                         s->buf_sectors * BDRV_SECTOR_SIZE);
 
     while (1) {
         int n;
@@ -2250,6 +2260,7 @@ static int img_convert(const img_cmd_t *ccmd, int argc, char **argv)
     bool explict_min_sparse = false;
     bool bitmaps = false;
     bool skip_broken = false;
+    bool stream_output;
     int64_t rate_limit = 0;
 
     ImgConvertState s = (ImgConvertState) {
@@ -2551,6 +2562,21 @@ static int img_convert(const img_cmd_t *ccmd, int argc, char **argv)
         goto fail_getopt;
     }
 
+    stream_output = !strcmp(out_filename, "-");
+    if (stream_output) {
+        if (strcmp(out_fmt ?: "", "raw") || skip_create || tgt_image_opts ||
+            options || out_baseimg || backing_fmt || s.compressed ||
+            s.copy_range || bitmaps || s.has_zero_init || rate_limit) {
+            error_report("stdout output supports only plain raw conversion "
+                         "without target options, bitmaps, compression, "
+                         "copy offloading or rate limiting");
+            goto fail_getopt;
+        }
+        s.stream_output = true;
+        s.min_sparse = 0;
+        s.wr_in_order = true;
+    }
+
     /* ret is still -EINVAL until here */
     ret = bdrv_parse_cache_mode(src_cache, &src_flags, &src_writethrough);
     if (ret < 0) {
@@ -2562,7 +2588,11 @@ static int img_convert(const img_cmd_t *ccmd, int argc, char **argv)
     if (s.quiet) {
         progress = false;
     }
-    qemu_progress_init(progress, 1.0);
+    if (stream_output) {
+        qemu_progress_init_stderr(progress, 1.0);
+    } else {
+        qemu_progress_init(progress, 1.0);
+    }
     qemu_progress_print(0, 100);
 
     s.src = g_new0(BlockBackend *, s.src_num);
@@ -2616,7 +2646,7 @@ static int img_convert(const img_cmd_t *ccmd, int argc, char **argv)
         goto out;
     }
 
-    if (!skip_create) {
+    if (!skip_create && !stream_output) {
         /* Find driver and parse its options */
         drv = bdrv_find_format(out_fmt);
         if (!drv) {
@@ -2667,7 +2697,7 @@ static int img_convert(const img_cmd_t *ccmd, int argc, char **argv)
     }
 
     /* Get backing file name if -o backing_file was used */
-    out_baseimg_param = qemu_opt_get(opts, BLOCK_OPT_BACKING_FILE);
+    out_baseimg_param = opts ? qemu_opt_get(opts, BLOCK_OPT_BACKING_FILE) : NULL;
     if (out_baseimg_param) {
         out_baseimg = out_baseimg_param;
     }
@@ -2745,7 +2775,7 @@ static int img_convert(const img_cmd_t *ccmd, int argc, char **argv)
      * bdrv_create() will purge "opts", so extract them now before
      * they are lost.
      */
-    if (!skip_create) {
+    if (!skip_create && !stream_output) {
         open_opts = qdict_new();
         qemu_opt_foreach(opts, img_add_key_secrets, open_opts, &error_abort);
 
@@ -2759,6 +2789,13 @@ static int img_convert(const img_cmd_t *ccmd, int argc, char **argv)
     }
 
     s.target_is_new = !skip_create;
+
+    if (stream_output) {
+        s.alignment = 1;
+        s.target_backing_sectors = -1;
+        ret = convert_do_copy(&s);
+        goto out;
+    }
 
     flags = s.min_sparse ? (BDRV_O_RDWR | BDRV_O_UNMAP) : BDRV_O_RDWR;
     ret = bdrv_parse_cache_mode(cache, &flags, &writethrough);
